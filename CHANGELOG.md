@@ -2,6 +2,215 @@
 
 Full release notes with details on each version: [GitHub Releases](https://github.com/safishamsi/graphify/releases)
 
+## 0.8.37 (2026-06-10)
+
+- Security: SSRF guard rewritten to eliminate thread-safety race. The global `socket.getaddrinfo` monkey-patch is replaced with per-connection `_SSRFGuardedHTTPConnection`/`_SSRFGuardedHTTPSConnection` subclasses that resolve DNS once, validate the IP, and connect to that exact address — closing both the concurrent-thread race window and the underlying TOCTOU gap. No global state is mutated, so sibling threads (MCP server, PR triage pool) are unaffected.
+- Security: Prompt injection mitigation for LLM semantic extraction. Untrusted source file content is now wrapped in `<untrusted_source path="..." sha256="...">` XML delimiters; jailbreak sentinel tokens (`<|im_start|>`, `[INST]`, `<<SYS>>`, forged closing tags) are neutralised with a zero-width space; the extraction system prompt includes an explicit SECURITY block stating that content inside the wrapper is inert data.
+- Fix: `export obsidian` and `export canvas` no longer crash with `KeyError` when a community contains a node ID absent from the graph (stale community index, merge artifacts). Dangling members are silently skipped.
+- Fix: `--update` on macOS no longer re-extracts all Office files on every run. `convert_office_file()` now NFC-normalises the source path before hashing the sidecar filename, so NFD paths returned by `os.walk` (HFS+/APFS) produce the same sidecar as NFC-constructed paths. An early-return when the sidecar exists prevents mtime bumps causing spurious re-detection.
+- Fix: Data `.json` files no longer explode into hundreds of orphan key-nodes. The JSON extractor now only processes config/manifest JSON (detected by filename — `package.json`, `tsconfig.json`, `.eslintrc.json`, `deno.json`, etc. — or by top-level keys such as `dependencies`, `extends`, `$ref`, `compilerOptions`). Data JSON (top-level arrays, generic key/value files) is skipped by the AST pass and left for the LLM semantic pass.
+- Fix: OpenAI-compatible backends no longer send `temperature=0` to reasoning models. `_resolve_temperature()` auto-detects o1/o3/o4 and gpt-5 series and omits temperature from the request. Override with `GRAPHIFY_LLM_TEMPERATURE=<value>` (or `none` to omit explicitly for any model).
+- Fix: EDR / corporate Windows hang eliminated. `datasketch` (which transitively imports `scipy` → `numpy.testing` → `platform.machine()` subprocess at import time) is replaced by a self-contained pure-numpy MinHash/MinHashLSH implementation with byte-identical hash math. Removes `datasketch` and `scipy` from the dependency tree.
+- Perf: `detect()` ignore-pattern checks memoized per scan. Each ancestor directory is now evaluated once across all sibling files, eliminating ~42M redundant `fnmatch` calls on large repos (~34% whole-run speedup on 2k-file corpora).
+- Fix: `dedup.py` label-based merge passes now skip code nodes entirely. Distinct same-named symbols in different files (e.g. two `Config` classes) were being merged by the exact-label and MinHash/LSH passes. Code nodes are now deduplicated by ID only, which is correct.
+- Feat: `GRAPHIFY_MAX_GRAPH_BYTES` env var to override the 512 MiB `graph.json` size cap. Accepts plain bytes, `<N>MB`, or `<N>GB`. The cap error message now cites this env var. `graphify export html` auto-falls back to the community-aggregation view when over cap instead of hard-failing.
+- Feat: `CLAUDE.md` template now uses mandatory language for the graphify-first rule — "MANDATORY: Before using Read/Grep/Glob/Bash to explore the codebase, you MUST run graphify first" — and explicitly requires forwarding the rule to subagent prompts. PreToolUse hook message hardened to match.
+- CI: Release workflow added. Every GitHub release now ships `graphify-self-graph.tar.gz` as a downloadable asset — `graph.json` + `graph.html` + `GRAPH_REPORT.md` from running Graphify on its own source. Open `graph.html` locally with no install required to see what Graphify produces.
+
+## 0.8.36 (2026-06-08)
+
+- Feat: `extra_body` field in `providers.json` forwarded to OpenAI-compat calls at extraction and labeling. Lets vLLM/Qwen3/Llama endpoints pass model-specific request shapes (e.g. `{"chat_template_kwargs": {"enable_thinking": false}}`). Explicit `extra_body` also bypasses Ollama `num_ctx` auto-derive. Thanks to @EirikWolf (#1197).
+- Feat: `label_communities` multi-batch for 16k-context models. Chunks of 100 communities per call (configurable `batch_size=`); `max_communities` defaults to `None` (label all); partial batch failures no longer drop the whole pass. Thanks to @EirikWolf (#1197).
+- Feat: `.slnx` Visual Studio solution file support. Extracts `contains` (project references) and `imports` (build dependencies) edges from the modern XML solution format (VS 2022 17.13+). Thanks to @bakgaard (#1189).
+- Feat: `graphify-mcp` console script. MCP stdio server now directly invocable as `graphify-mcp` from `uv tool install` / `pipx`. Thanks to @jr2804 (#1190).
+- Fix: `label_communities` token budget raised and `GRAPHIFY_MAX_OUTPUT_TOKENS` now honoured. Hardcoded `min(40+16n, 4096)` undershooted (~16 tok/community); raised to `min(64+24n, 8192)` and wrapped in `_resolve_max_tokens()` (#1200).
+- Fix: `find_import_cycles` no longer hangs on large graphs. `nx.simple_cycles()` now receives `length_bound=max_cycle_length`, pruning during enumeration rather than post-filtering — drops from never-returns to ~0.1s on dense graphs (#1196).
+- Fix: fuzzy dedup no longer merges prefix-extension symbol pairs. `getActiveSession`/`getActiveSessions`, `parseConfig`/`parseConfigFile` etc. scored ~98-99 JW and were auto-merged. A prefix-extension guard now prevents merge when one normalised label is a strict prefix of the other, in both Pass 2 and the LLM tiebreaker (#1201).
+- Fix: `_norm`, `_norm_label`, `_strip_diacritics` guard against `None` node labels, preventing `TypeError` crash on corpora with explicit `null` label fields (#1194). Thanks to @freiit (#1195).
+- Fix: skill frontmatter `trigger:` field removed from all 14 skill variants — not part of Agent Skills spec, flagged by `agentskills validate` CI (#1180).
+
+## 0.8.35 (2026-06-07)
+
+- Feat: CodeBuddy platform support. `graphify codebuddy install` installs the graphify skill to `~/.codebuddy/skills/graphify/SKILL.md`, writes a `CODEBUDDY.md` always-on section, and registers Bash + Read|Glob PreToolUse hooks in `.codebuddy/settings.json` that nudge the agent toward `graphify query` instead of grepping raw files when a graph exists. `graphify install --platform codebuddy` and `graphify codebuddy uninstall` also supported. Thanks to @studyzy (#1136).
+- Fix: `graphify --update` no longer destructively collapses distinct same-named symbols across files. The skill's `--update` merge now passes re-extracted (changed) files to `prune_sources` alongside deleted files, so old nodes for changed files are pruned before fresh AST is inserted — no fuzzy reconciliation needed. Separately, `dedup.py` Pass 1 now skips nodes with an empty `source_file` so label-only merging across no-source-file nodes is prevented. The anti-shrink guard message now names fuzzy dedup as a possible cause rather than only blaming missing chunk files (#1178).
+
+## 0.8.34 (2026-06-07)
+
+- Feat: Streamable HTTP transport for the MCP server. `python -m graphify.serve graph.json --transport http --port 8080 --api-key $SECRET` serves the graph over the MCP Streamable HTTP transport (spec 2025-03-26) so a single shared process can serve the whole team. Flags: `--host`, `--port`, `--api-key` (env `GRAPHIFY_API_KEY`), `--path`, `--json-response`, `--stateless`, `--session-timeout`. Docker image included. stdio remains the default (#1143).
+- Feat: Salesforce Apex extractor. `.cls` and `.trigger` files are now AST-extracted via regex (no tree-sitter grammar exists for Apex). Extracts classes, interfaces, enums, methods, triggers, and SOQL/DML edges (#1159).
+- Feat: Azure OpenAI Service backend. `--backend azure` reads `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` and auto-detects both. Uses the existing `openai` package — no new dependency (#1107).
+- Feat: live PostgreSQL introspection. `graphify extract --postgres "postgresql://..."` connects directly to a running database and maps tables, views, routines, and FK relations via `information_schema` in a `SERIALIZABLE READ ONLY` transaction. New `graphify[postgres]` extra (psycopg3). Credentials are sanitized from error messages (#1103).
+- Feat: vision and PDF support in headless extract. Images now route through per-backend vision payloads (base64/data-URI for claude/openai, file path for claude-cli, bytes for bedrock) instead of producing garbage binary data. Non-vision backends get a text reference via `_strip_pixels`. PDFs reuse pypdf. 5MB cap, 20-image chunk limit (#1110).
+- Fix: `graphify update` now prunes symbols removed from files that still exist on disk. Previously, deleting a function left a ghost node in the graph until the source file itself was deleted. Every AST node is now stamped with `_origin="ast"`; on a full rebuild any stamped node absent from the fresh output is dropped (#1118).
+- Fix: `graphify path` and `shortest_path` now fire the exact-match bonus for multi-word queries. The per-token comparison never equalled a full multi-word label, so the exact bonus was silently skipped for queries like `"AuthService"` when the label contained punctuation or spaces. The full normalized query is now compared alongside each token (#1165).
+- Fix: `_is_sensitive` no longer flags topic-mentioning filenames as secrets. `token-economics-of-recall.md` and `password-policy-discussion.md` were silently dropped. Generic keywords (token/secret/password) now only fire when the keyword ends the filename stem or the stem is ≤2 words; specific patterns (`.env`, `.pem`, `id_rsa`, etc.) remain unconditional (#1169).
+- Fix: git hooks no longer use `nohup` to background the rebuild. Git for Windows' MSYS shell has no `nohup`, causing the post-commit/post-checkout hook to fail silently and the graph to go stale. Replaced with a cross-platform Python launcher using `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows and `start_new_session=True` on POSIX (#1161 / #1170).
+- Fix: post-commit and post-checkout hooks now respect an existing `.graphify_root`. A scoped build (`graphify src/`) was silently expanded to the full repo on the next commit because the hook hardcoded `Path('.')`. The hook body now reads `graphify-out/.graphify_root` first (#1173).
+- Fix: `graphify affected` now forces a directed graph on load, matching the identical fix already applied in `serve.py` and `__main__.py`. On undirected graphs (`"directed": false` in graph.json) the traversal was direction-blind — missing true callers and reporting callees as affected (#1174).
+- Fix: Step 9 skill cleanup no longer aborts under fish/zsh on pure-code corpora. The `rm -f ... .graphify_chunk_*.json` glob errored with "no matches found" when no chunk files existed, leaving other temp files on disk. Split into `rm -f` for fixed filenames and `find -maxdepth 1 -delete` for the chunk glob (#1172).
+- Fix: `detect_incremental` no longer crashes on schema-drifted manifest files. A dict-valued `mtime` entry (from an older richer schema) is now coerced to `None` and the file is treated as new rather than raising a comparison error (#1163).
+- Fix: numpy pinned to `>=2.0` only on Python 3.13+ in the `svg` and `all` extras. numpy 1.26.4 ships no `cp313` wheel so `uv sync` fell back to a source build requiring a C compiler (#1153 / #1154).
+- Fix: Codex platform skill now installs to `.codex/skills/graphify/` (was `.agents/skills/graphify/`), aligning with where the hook already lives (#1160).
+
+## 0.8.33 (2026-06-06)
+
+- Feat: install banner — `graphify install` now prints an amber knowledge-graph brain in the terminal (TTY-only, silent in CI/pipes, never raises).
+- Fix: Python `from pkg import submod` package-form imports now resolve to a file-level `imports_from` edge to the submodule file when it exists on disk. Previously these imports produced zero edges, leaving test files as disconnected islands in the graph (up to 66% of test nodes in some corpora). The fix lives in the symbol-resolution post-pass which has filesystem access (#1146).
+- Fix: builtin type-annotation nodes (`str`, `int`, `bool`, `float`, `bytes`, `MagicMock`, `Mock`, `AsyncMock`, etc.) no longer appear as graph nodes or accumulate edges. They were being created via the annotation walker whenever used as parameter or return types, inflating degree counts ~25% and displacing real abstractions from god-node rankings. A new `_PYTHON_ANNOTATION_NOISE` filter suppresses them at extraction time; `god_nodes` also filters them as a defense for pre-existing graphs (#1147).
+- Fix: AST/semantic ghost-duplicate nodes are now auto-merged at build time. When AST and semantic extraction produce different IDs for the same symbol (one with `source_location=L<n>`, one without), `build_from_json` detects the pair by `(source_file basename, label)` and collapses the semantic ghost into the AST node, re-pointing all edges. Graphs built before this release can be cleaned up with `graphify extract . --force` (#1145).
+
+## 0.8.32 (2026-06-05)
+
+- Feat: Terraform/HCL support. `.tf`, `.tfvars`, and `.hcl` files are now AST-extracted via `tree-sitter-hcl` into a structured infrastructure dependency graph. Nodes: resources, data sources, modules, variables, outputs, providers, and locals. Edges: `contains`, `references` (interpolation), and `depends_on`. Node IDs are directory-scoped for cross-file resolution. Requires `uv tool install "graphifyy[terraform]"` (#1129).
+- Fix: `graphify extract` no longer requires an LLM API key for code-only corpora. Backend resolution is now deferred until after file detection — a corpus with only code files (pure tree-sitter AST, zero LLM calls) runs fully offline. The key is only enforced when docs, PDFs, or images are present, or when `--dedup-llm` is passed (#1122).
+- Fix: `graphify kiro install` now correctly installs the `references/` sidecar and `.graphify_version` stamp. The install was using a bare `write_text` that bypassed the shared helper, shipping `SKILL.md` with 8 dead `references/*.md` pointers. Re-run `graphify kiro install` to pick up the fix (#1142).
+- Fix: `GRAPHIFY_API_TIMEOUT` now applies to `claude-cli` subprocess and Anthropic SDK backend, not just the HTTP client. Both subprocess paths previously hardcoded `timeout=600` and ignored the env var and `--api-timeout` flag (#1112).
+- Build: version floors added for `networkx>=3.4`, `datasketch>=1.6`, and `rapidfuzz>=3.0` to prevent silent breakage from old installs resolving incompatible versions.
+
+## 0.8.31 (2026-06-03)
+
+- Fix: `graphify hook install` now embeds the current interpreter (`sys.executable`) directly into the generated hook scripts. Previously, uv tool and pipx installs silently no-oped on git commit in GUI clients and CI runners where `~/.local/bin` is not on PATH — the hook could not find the graphify launcher, fell through all detection probes, and exited 0 without rebuilding. The embedded path is sanitized through a filesystem-safe allowlist before substitution. If you already have hooks installed, re-run `graphify hook install` to pick up the fix (#1127).
+- Fix: hook scripts now also probe `graphify-out/.graphify_python` as a fallback interpreter source, covering Windows/Git Bash installs where the launcher is a binary with no parseable shebang, and the case where the pinned path goes stale after a reinstall.
+- Security: hook script hardening — the `_PINNED=` assignment uses single quotes to prevent shell injection from a path containing metacharacters; `nohup "$GRAPHIFY_PYTHON" -c` is properly quoted to handle spaces; the fallback emits a loud stderr diagnostic instead of a bare silent `exit 0`.
+- Feat: query logging. Every `graphify query`, `graphify path`, `graphify explain`, and MCP `query_graph` call is now appended to `~/.cache/graphify-queries.log` in JSON Lines format (timestamp, kind, question, corpus path, nodes returned, result size, duration). Full subgraph responses are not stored by default. Control with `GRAPHIFY_QUERY_LOG` (path override), `GRAPHIFY_QUERY_LOG_DISABLE=1` (opt out), `GRAPHIFY_QUERY_LOG_RESPONSES=1` (store full response text) (#1128).
+
+## 0.8.30 (2026-06-03)
+
+- Fix: `graphify install --project --platform antigravity` now writes Antigravity's always-on layer (`.agents/rules/graphify.md` + `.agents/workflows/graphify.md`), not just the skill. The project-scoped path went through the skill-only branch and skipped them, even though the project uninstall removes them.
+- Feat: close the Read-tool graph bypass. The `PreToolUse` nudge previously only fired on Bash search (`grep`/`rg`/`find`); an agent answering a question by reading many source files through the native `Read` tool (or `Glob`) slipped past it. A new `Read|Glob` hook nudges toward `graphify query` when `graphify-out/graph.json` exists, only for a source/doc file outside `graphify-out/`, and never blocks (#1114).
+- Feat: add an `anthropic` optional extra (and include it in `[all]`) so the `claude` backend is installable like every other one: `uv tool install "graphifyy[anthropic]"`. Previously it was the only backend with no extra, so a user with `ANTHROPIC_API_KEY` set could not satisfy it without `--with anthropic`. The backend package-missing errors now point at `uv tool install "graphifyy[<extra>]"` (the isolated-venv path) rather than only `pip install`.
+
+## 0.8.29 (2026-06-02)
+
+- Feat: progressive-disclosure skill files. The per-host `SKILL.md` is now a lean core (~615 lines, down from the ~1156-line monolith, about 47% less always-loaded context) that carries the full default code-build pipeline inline and links to an on-demand `references/` sidecar (extraction-spec, query, update, exports, transcribe, github-and-merge, add-watch, hooks); an agent reads a reference only when that path is actually taken, so a normal build needs none. 18 hosts go progressive (claude, codex, opencode, kilo, copilot, claw, droid, trae, trae-cn, hermes, kiro, pi, antigravity, antigravity-windows, windows, kimi, amp, gemini); aider and devin stay monolithic by design. All 15 skill bodies + sidecars are generated from one source under `tools/skillgen/`, with CI guards (`--check`, `--audit-coverage`, `--monolith-roundtrip`, `--always-on-roundtrip`) proving the references are byte-identical slices of the old monolith so nothing is lost (#1121).
+- Fix: `graphify install --platform gemini` shipped a `SKILL.md` with 8 dead `references/` pointers. gemini installs claude's lean progressive core but the installer never copied claude's references sidecar; it now does, so every on-demand reference resolves (regression from the progressive-disclosure split).
+- Security (F1): a project-local `./.graphify/providers.json` (which travels with a cloned or shared repo) is no longer loaded automatically, since a custom provider's `base_url` is where your corpus and API key are sent. Set `GRAPHIFY_ALLOW_LOCAL_PROVIDERS=1` to opt in; the user's own `~/.graphify/providers.json` is still trusted. Non-http(s) `base_url`s are rejected on load and on `provider add`, and plaintext-http egress warns. **Behavior change:** if you relied on an auto-loaded project-local providers file, set the opt-in env var.
+- Security (F2): untrusted office/PDF files are screened before parsing (on-disk size cap, plus a bounded streaming-decompression ceiling for `.docx`/`.xlsx` zip containers) so a zip-bomb in a scanned corpus can no longer exhaust memory.
+- Security (F3): `OLLAMA_BASE_URL` pointing at a link-local or cloud-metadata address (`169.254.x`, `metadata.google.*`, or any host that resolves to one) now fails closed with a clean error instead of sending the corpus there. Trusted LAN hosts still warn-and-allow.
+- Security (F5): the Fortran C-preprocessor step passes an absolute path so an attacker-named corpus file cannot be interpreted as a `cpp` option.
+
+## 0.8.28 (2026-06-01)
+
+- Feat: Kilo Code support — `graphify install --platform kilo` installs a native skill (`~/.config/kilo/skills/graphify/SKILL.md`) and `/graphify` command, plus a `.kilo` `tool.execute.before` plugin (mirroring the OpenCode integration). Existing `.kilo/kilo.jsonc` config is read but never rewritten — plugin registration goes to `kilo.json` so user comments are preserved (#512)
+- Feat: modernized Dart extractor — comment stripping, `part of` redirection, nested-generic-aware `extends`/`with`/`implements` parsing, generic type-argument mapping, and generic call detection (#1098)
+- Fix: `uv tool install graphifyy` / `pip install graphifyy` no longer fails to build on Linux/macOS — `tree-sitter-dm` (BYOND DreamMaker) ships only a Windows wheel, so on other platforms it compiled from source and aborted the entire install when a C toolchain or `python3-dev` headers were missing. It is now an optional extra (`graphifyy[dm]`, also in `[all]`) instead of a core dependency, so the default install needs no compiler (#1104).
+  - **Upgrade note:** DreamMaker `.dm`/`.dme` users must reinstall with `graphifyy[dm]` (or `[all]`) to keep AST extraction — on `uv tool upgrade` the now-optional grammar is removed. `.dmi`/`.dmm`/`.dmf` parsing is unaffected (no tree-sitter dependency).
+- Fix: community IDs are now assigned by a total order (`(-size, sorted node IDs)`) so an identical grouping always gets identical IDs across runs — previously the equal-sized small communities that dominate a sparse graph were numbered by the partitioner's (not seed-stable) enumeration order, making a per-node community diff report large spurious "churn" even though the actual grouping was reproducible (#1090 follow-up)
+- Fix: `graphify amp install` now writes the skill where Amp actually looks for it. It was landing in `.amp/skills/graphify` (project) and `~/.amp/skills/graphify` (user), neither of which Amp searches, so the skill never loaded. User-scope installs now go to `~/.config/agents/skills/graphify` and project installs to `.agents/skills/graphify`, and a stale `~/.amp/skills/graphify` from an older install is cleaned up on the next run.
+
+## 0.8.27 (2026-05-31)
+
+- Feat: standalone CLI now auto-names communities with the configured backend instead of leaving `Community N` placeholders — community labeling was previously an agent-only step (skill.md Step 5), so bare-CLI runs never got semantic names; `cluster-only` now auto-labels when no `.graphify_labels.json` exists, new `graphify label <path>` subcommand (re)generates names on demand, `--no-label` opts out, `--backend=<name>` overrides auto-detection; one batched LLM call with per-community placeholder fallback and graceful degradation on missing backend/API error; works with all built-in and custom OpenAI-compatible backends (#1097)
+- Fix: AST file-level node IDs now match the skill.md `{parent_dir}_{stem}` spec — they were derived from the full relative path plus extension (`match_script_pipeline_step_py`) while semantic subagents use `script_pipeline_step`, splitting every file into two disconnected ghost nodes; fixed at the single relative-path remap chokepoint so file nodes and all import/dependency edge endpoints (Python, TS, Lua, C, bash) convert together (#1033)
+- Fix: symbol-level node IDs for root-level files now match the spec too — the #1033 remap relativized file nodes but symbols still embedded the absolute parent-dir name (`<rootdir>_main_run` vs spec `main_run`), splitting every top-level file's symbols into AST/semantic ghost pairs; the remap now canonicalizes symbol stems and `raw_calls` caller IDs, gated by `source_file` (#1096)
+- Fix: TypeScript `interface A extends B` and same-file `class X extends Y` now produce `inherits`/`implements` edges — the walker only inspected `class_heritage` (missing the interface `extends_type_clause` node) and the resolver only consulted the import table (missing same-file bases); both gaps closed (#1095)
+- Fix: `graphify export obsidian` no longer crashes with `OSError ENAMETOOLONG` on long node labels — `to_obsidian`/`to_canvas` now cap filenames on UTF-8 bytes (not chars, so multibyte/CJK labels are handled) with an 8-char hash suffix on truncation to keep distinct long-prefix labels from colliding; also fixes the previously-uncapped `_COMMUNITY_` notes (#1094)
+- Fix: `graph.json` is now deterministic across runs — `detect()` sorts file traversal lexicographically (`os.walk` order is filesystem-dependent), which had made first-writer-wins node-ID decisions and Leiden community counts vary between identical runs (#1090)
+- Fix: Windows consoles no longer crash with `UnicodeEncodeError` on non-UTF-8 code pages — `main()` reconfigures stdout/stderr to UTF-8 at startup and `→`/`—` in print statements replaced with ASCII (#992)
+
+## 0.8.26 (2026-05-30)
+
+- Feat: `find_import_cycles(G)` in `analyze.py` detects file-level circular import dependencies — collapses symbol graph to file-level directed import graph, finds simple cycles via Johnson's algorithm, deduplicates rotations, renders `## Import Cycles` section in `GRAPH_REPORT.md` (#961)
+- Feat: custom LLM provider registry — `graphify provider add/list/show/remove` registers any OpenAI-compatible endpoint (NVIDIA NIM, vLLM, OpenRouter, Together, LiteLLM) via `~/.graphify/providers.json`; custom providers auto-detected after built-ins in `detect_backend()` priority (#1084)
+- Fix: `extract_files_direct()` no longer silently defaults to kimi (Moonshot AI) — `backend=None` now calls `detect_backend()` and raises a clear `ValueError` if no key is configured, matching CLI behavior; README Privacy section updated with data-residency notes (#1086)
+- Fix: `pnpm-workspace.yaml` with `packages: - '.'` no longer crashes with `IndexError: tuple index out of range` on Python 3.10 — `Path.glob('.')` replaced with `[root]` guard in `_load_workspace_packages`; `GRAPHIFY_DEBUG=1` env var added to `_safe_extract` for full traceback on extraction errors (#1083)
+- Fix: anchored `.graphifyignore` patterns (leading `/`) no longer match the same directory name anywhere in the tree — `_matches()` in both `_is_ignored` and `_is_included` now gates basename/segment shortcuts on `not anchored`; anchored patterns do exact anchor-relative path match only (#1087)
+- Docs: Filipino (fil-PH) README translation added (#1080)
+
+## 0.8.25 (2026-05-29)
+
+- Fix: JS/TS `const`/`let` inside arrow-function callbacks no longer emit phantom god-nodes — scope guard restricts `_js_extra_walk` node emission to program-level declarations only; applies uniformly to JS, TS, and TSX (#1077)
+- Fix: fenced code blocks in Markdown no longer emit orphan `codeblock_N` nodes — they had only `contains` edges and no semantic meaning; fence-toggle still prevents inner content from being mis-parsed as headings (#1077)
+- Fix: Lua `require("pkg.sub")` now resolves to the correct file node ID — dots converted to path separators, probes filesystem for `.lua`/`.luau`/`init.lua` variants up the directory tree (#1075)
+- Fix: Windows `claude-cli` backend no longer raises `WinError 2` — prefers `claude.cmd` over bare `claude` to avoid PATHEXT `.ps1` resolution failure (#1072)
+- Fix: post-commit hook no longer silently drops `changed_paths` when another rebuild holds the lock — lock-losers queue paths to a pending file; the lock-holder drains and merges on acquire (#1059)
+- Fix: `graphify install antigravity` global install now writes to `~/.gemini/config/skills/` (per Antigravity docs) instead of the wrong `~/.agents/`; uninstall, version-stamp refresh, and project-scope install all updated to match (#1079)
+- Docs: README warns against `pip install` on Mac/Windows due to Python env mismatch causing `ModuleNotFoundError`; `uv tool install` recommended as primary method (#1074)
+
+## 0.8.24 (2026-05-29)
+
+- Feat: type-reference edges for ObjC, Julia, C, C++, Scala, Fortran, and PowerShell — extends cross-language semantic context work from #1015 to a second wave of languages; CI matrix now covers Python 3.10 with `faster-whisper` version guard (#1071)
+- Fix: claude-cli backend no longer loops on hollow streamed responses — handles all four documented failure modes (empty stream, no JSON, missing `result`, empty `result`) with tests (#1063)
+- Fix: `calls` edges no longer flip caller/callee when the same node pair appears in both directions in an undirected build — first-seen direction preserved on bidirectional collision (#1061)
+- Fix: `graphify-out/.graphify_python` path prefix was missing in 8 skill files (256 instances) causing `cat: .graphify_python: No such file or directory` on every non-Claude-Code platform
+- Chore: all skill files now use uv-aware interpreter detection — `uv tool run graphifyy python` preferred over shebang parsing when uv is available
+
+## 0.8.23 (2026-05-28)
+
+- Feat: type-reference edges for Swift, Kotlin, PHP, Rust, and Go — `references` edges with `parameter_type`, `return_type`, `generic_arg`, `field`, and `attribute` contexts; inheritance split into `inherits` (superclass) vs `implements` (protocol/interface/trait) for all five languages (#1015)
+- Chore: CI switched from pip to uv (`astral-sh/setup-uv`, `uv sync`, `uv run pytest`); `uv.lock` committed for reproducible installs; dev setup docs updated (#885)
+
+## 0.8.22 (2026-05-28)
+
+- Feat: BYOND DreamMaker support — `.dm`/`.dme` files extracted via tree-sitter-dm (type definitions, proc declarations, `#include` edges, in-file call resolution, `new /type()` instantiation edges); `.dmi` PNG icon files parsed for icon-state nodes; `.dmm` map files parsed for type-path `uses` edges from the tile dictionary section; `.dmf` interface files parsed for window/elem/control-type hierarchy (#884)
+- Feat: `graphify extract --mode deep` flag enables richer semantic extraction using an extended system prompt; flag propagated through all four LLM backends (#1030)
+
+## 0.8.21 (2026-05-27)
+
+- Fix: `graphify update` (no `--changed` flag) no longer leaves ghost nodes from files deleted between runs — full re-extraction path now reconciles the existing graph against current disk state and evicts any node whose `source_file` no longer exists; `_norm_source_file` used on both sides to guarantee path format consistency (#1007)
+- Fix: `graphify install --platform opencode --project` now writes `SKILL.md` to `.opencode/skills/graphify/SKILL.md` (discoverable by OpenCode) instead of the incorrect `.config/opencode/skills/` path; git-add hint updated accordingly (#1040)
+- Fix: post-commit hook no longer triggers rebuild when only `graphify-out/` files were committed (avoids infinite dirty-tree loop when graph outputs are tracked in git); `GRAPHIFY_SKIP_HOOK=1` env var added for one-off skip; hook rebuild log now appends (`>>`) instead of overwriting (`>`) (#1018, #1037)
+- Fix: graph output is now byte-for-byte deterministic across runs — edges sorted by `(source, target, relation)` in `build_from_json`; `PYTHONHASHSEED=0` exported in hook scripts to stabilize Louvain community ordering (#1010)
+- Feat: Amp (ampcode.com) platform support — `graphify amp install/uninstall` installs the skill into `.amp/skills/graphify/SKILL.md` (#948)
+- Fix: query punctuation no longer breaks node matching — `"what calls extract?"` correctly finds the `extract` node; `_search_tokens` helper strips punctuation from search terms in `_query_terms`, `_score_nodes`, and `_find_node` (#994, #978)
+- Fix: language built-in globals (`String`, `Number`, `Boolean`, `Object`, `Array`, etc.) no longer accumulate spurious call edges — filtered at same-file and cross-file resolution in the AST extractor, eliminating god-node pollution from constructor-style calls (#916, #726)
+- Feat: SystemVerilog header files (`.svh`) now extracted using the Verilog parser alongside `.v` and `.sv` (#1042)
+- Fix: `@property`, `@staticmethod`, `@classmethod` methods no longer produce orphaned nodes without a class-qualified ID — `decorated_definition` is now treated as a transparent wrapper in the Python AST walker, preserving `parent_class_nid` through the decorator layer (#1050)
+- Fix: Pass 2 dedup no longer merges nodes with identical labels that live in different files — same-file partition enforced for the identical-label subcase so `foo()` in `a.py` and `foo()` in `b.py` are not collapsed into one node (#1046)
+- Fix: `graphify-out/memory/` files are no longer silently excluded by `.gitignore` pattern matching — memory dir files now bypass the gitignore filter in `detect.py`, ensuring knowledge accumulated via `graphify remember` is always scanned (#1047)
+
+## 0.8.20 (2026-05-26)
+
+- Fix: stale nodes persist after `graphify update` when files are deleted on Windows — `deleted_paths` and `evict_sources` in `_rebuild_code` now use `.as_posix()` for consistent forward-slash paths; `_relativize_source_files` called on the existing graph before eviction (not after); `_relativize_source_files` itself now produces forward slashes (#1007)
+- Fix: `graphify extract` stale-node pruning now also handles symlinked scan roots — `prune_set` expansion uses `Path(root).resolve()` before `relative_to()` so symlinked roots produce correct relative paths (#1007)
+- Feat: MCP config extractor — `.mcp.json`, `mcp.json`, `mcp_servers.json`, `claude_desktop_config.json` now extracted into the knowledge graph; captures server nodes, npm/pip package refs, env var requirements; env values discarded to prevent secret leakage (#1034)
+- Fix: `cluster-only` no longer drops community label alignment after re-clustering — `remap_communities_to_previous` now applied in the `cluster-only` path, matching the behaviour of `graphify update` (#1028)
+- Fix: Dart child node IDs no longer embed absolute paths — switched from `_make_id(str(path), name)` to `_make_id(_file_stem(path), name)`, consistent with all other extractors; existing Dart graphs should be rebuilt with `--force` (#999)
+- Security: XML parsing in `extract_csproj` and `extract_lazarus_package` now pre-screens for `<!DOCTYPE` / `<!ENTITY` declarations before calling `ET.fromstring`, blocking billion-laughs DoS on malicious project files; `extract_lpk` also gains the missing 2 MiB size cap
+
+## 0.8.19 (2026-05-26)
+
+- Feat: .NET project file support — `.sln`, `.csproj`, `.fsproj`, `.vbproj`, `.razor`, `.cshtml` now extracted; captures NuGet package refs, project-to-project dependencies, target frameworks, SDK attributes, Blazor/Razor directives (`@using`, `@inject`, `@inherits`, `@model`, `@page`), component refs, and `@code` block methods (#1025)
+- Feat: Chinese query segmentation — compound Chinese tokens (e.g. `页面路由`) are split into meaningful words using jieba when installed, with character bigram fallback; original compound preserved alongside segments for exact-match; new `pip install "graphifyy[chinese]"` extra (#1026)
+- Fix: Wiki TypeError when `source_file` is `None` — `G.nodes[n].get("source_file") or ""` replaces `.get("source_file", "")`, which did not handle explicit `None` values (#1016)
+- Fix: Nested `.claude/worktrees/` no longer indexed — `_is_noise_dir` now accepts an optional `parent` param and skips `worktrees/` directories nested inside dotted dirs like `.claude/` (#1023)
+- Fix: `backup_if_protected` no longer accumulates one folder per run — uses content-hash comparison to skip identical backups and overwrite in-place when content changes; one folder per day maximum
+- Feat: Devin CLI support — `graphify devin install/uninstall` installs the skill into Devin's `.devin/rules/` directory (#1020)
+- Fix: TypeScript 5.0 array-form `extends` in `tsconfig.json` now handled — `_read_tsconfig_aliases` normalizes `extends` to a list before iteration (#1017)
+
+## 0.8.18 (2026-05-24)
+
+- Fix: post-commit hook now updates graph after delete-only commits — shrink-guard is bypassed when `changed_paths` contains explicit deletions, preventing stale nodes from accumulating indefinitely (#1000)
+- Fix: `graphify export` (html/obsidian/wiki/svg/graphml/neo4j) no longer collapses to "Single community" when `.graphify_analysis.json` is absent — falls back to per-node `community` attribute already present in `graph.json` (#1001)
+- Fix: Ukrainian README translation updated to v8 — all new sections, correct badges, 31 languages (#995)
+- Feat: semantic context tags on `references` edges for Python/JS/TS/C#/Java — `parameter_type`, `return_type`, `generic_arg`, `attribute`, `field`; C#/Java split `inherits`/`implements`; dedup key now includes context (#996)
+  - **Breaking:** Java `extends` edges are now emitted as `inherits` — queries filtering on `relation="extends"` for Java nodes must be updated to `relation="inherits"`
+- Feat: constrained query expansion in skill — Step 0 extracts actual graph vocab and forces LLM to pick expansion tokens only from that set, preventing hallucinated expansions; Unicode regex fix captures Cyrillic/CJK labels (#998)
+- Docs: Ukrainian README updated to v8 with all new sections, correct badges, YC badge, 31 language count (#995)
+
+## 0.8.17 (2026-05-23)
+
+- Fix: Case-sensitive call resolution for Go, Rust, and Elixir — resolvers previously lowercased both the label index and the callee name, causing `Authorize` to match `authorize` and produce phantom edges; Ruby/C#/Java/Kotlin/Scala/PHP use the same generic resolver which now splits into case-sensitive (all languages) and case-insensitive (PHP only, where function/class names are genuinely case-insensitive) dicts (#993)
+- Fix: Cross-language phantom `calls` edges from semantic extraction dropped at graph-build time — INFERRED `calls` edges whose source and target nodes belong to different language families (py/js/go/rs/jvm/c/cpp/rb/php/cs/swift/lua) are now discarded; skill.md prompt updated with an explicit anti-rule (#991)
+
+## 0.8.16 (2026-05-22)
+
+- Fix: CJK/Unicode labels no longer silently stripped during dedup — `_norm()` and `_norm_label()` now use Unicode-aware `[\W_]+` regex with `casefold()` and NFKC normalization; previously `道具処理クラス` and any non-ASCII label collapsed to empty string and got falsely merged (#937)
+- Fix: `.ets` (ArkTS/HarmonyOS) files now recognized as code and extracted via the TypeScript parser (#926)
+- Fix: `graphify` now exits non-zero when all semantic-extraction chunks fail — previously a silent empty graph was written with exit code 0, masking backend failures (#889)
+- Feat: `graphify install --project` installs the skill into the current repository (`.claude/skills/`, `.agents/skills/`, etc.) instead of the user home directory; per-platform subcommands support the same flag (#931)
+- Docs: Uzbek (uz-UZ) README translation (#982)
+
+## 0.8.15 (2026-05-22)
+
+- Fix: `cluster-only` subcommand crashed with `FileNotFoundError` when `graphify-out/` did not yet exist — output directory is now created before any write (#934)
+- Fix: `GRAPHIFY_MAX_OUTPUT_TOKENS` env var now respected for all OpenAI-compatible backends — previously the token limit was hardcoded, causing truncated responses on high-context queries (#973)
+- Fix: Swift extension nodes no longer duplicated across files — `_merge_swift_extensions` deduplicates by canonical name before graph insertion (#969)
+- Fix: Non-Latin query terms (CJK, Arabic, Cyrillic, etc.) now preserved through query preprocessing — previous normalization stripped non-ASCII chars, making multi-lingual codebases unsearchable (#964)
+- Feat: Multigraph runtime compatibility probe — emits a warning if a `MultiDiGraph` is passed where a `Graph` is expected by any downstream consumer (analyze, cluster, wiki, export, report) (#956)
+- Feat: JS/TS barrel re-exports tracked as explicit `re_exports` graph edges — `export { X } from './mod'` emits typed edges with `context="re-export"` and `confidence=EXTRACTED`; file-level `imports_from` edges also emitted (#960)
+- Feat: `--affected` and `--import-resolution` flags for the `v8` subcommand — impact analysis and cross-file import resolution exposed as first-class CLI options
+
 ## 0.8.14 (2026-05-20)
 
 - Fix: `--wiki` crash when community node IDs are stale after dedup or re-extract — stale IDs are now silently dropped with a stderr warning; raises a clear error only if every ID is stale (#936)

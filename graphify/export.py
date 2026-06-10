@@ -1,5 +1,6 @@
 # write graph to HTML, JSON, SVG, GraphML, Obsidian vault, and Neo4j Cypher
 from __future__ import annotations
+import hashlib
 import html as _html
 import json
 import math
@@ -62,10 +63,16 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
     reason = "+".join(filter(None, ["semantic" if is_semantic else "", "curated" if is_curated else ""]))
     today = date.today().isoformat()
     backup_dir = out / today
-    suffix = 2
-    while backup_dir.exists():
-        backup_dir = out / f"{today}_{suffix}"
-        suffix += 1
+    graph_src = out / "graph.json"
+
+    # Skip re-copying if today's backup already has identical graph.json content.
+    # If content differs (graph changed since the last backup today), overwrite
+    # the backup in place — one folder per day, always the latest pre-overwrite state.
+    if backup_dir.exists() and (backup_dir / "graph.json").exists():
+        src_hash = hashlib.sha256(graph_src.read_bytes()).hexdigest()
+        bak_hash = hashlib.sha256((backup_dir / "graph.json").read_bytes()).hexdigest()
+        if src_hash == bak_hash:
+            return backup_dir  # identical content, nothing to do
 
     try:
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -79,11 +86,11 @@ def backup_if_protected(out_dir: Path) -> "Path | None":
                 except Exception:
                     pass
         if copied:
-            print(f"[graphify] backed up {reason} graph ({copied} files) → {backup_dir.name}/")
+            print(f"[graphify] backed up {reason} graph ({copied} files) -> {backup_dir.name}/")
         return backup_dir
     except Exception as exc:
         import sys
-        print(f"[graphify] warning: backup failed ({exc}) — continuing with overwrite", file=sys.stderr)
+        print(f"[graphify] warning: backup failed ({exc}) - continuing with overwrite", file=sys.stderr)
         return None
 
 def _obsidian_tag(name: str) -> str:
@@ -95,8 +102,10 @@ def _obsidian_tag(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-/]", "", name.replace(" ", "_"))
 
 
-def _strip_diacritics(text: str) -> str:
+def _strip_diacritics(text: str | None) -> str:
     import unicodedata
+    if not isinstance(text, str):
+        text = "" if text is None else str(text)
     nfkd = unicodedata.normalize("NFKD", text)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 
@@ -477,6 +486,8 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
     existing_path = Path(output_path)
     if not force and existing_path.exists():
         try:
+            from graphify.security import check_graph_file_size_cap
+            check_graph_file_size_cap(existing_path)
             existing_data = json.loads(existing_path.read_text(encoding="utf-8"))
             existing_n = len(existing_data.get("nodes", []))
             new_n = G.number_of_nodes()
@@ -484,9 +495,12 @@ def to_json(G: nx.Graph, communities: dict[int, list[str]], output_path: str, *,
                 import sys as _sys
                 print(
                     f"[graphify] WARNING: new graph has {new_n} nodes but existing "
-                    f"graph.json has {existing_n}. Refusing to overwrite — you may be "
-                    f"missing chunk files from a previous session. "
-                    f"Pass force=True to override.",
+                    f"graph.json has {existing_n} (net -{existing_n - new_n}). "
+                    f"Refusing to overwrite. Possible causes: missing chunk files from "
+                    f"a previous session, or fuzzy dedup collapsed same-named symbols "
+                    f"across files during an --update on an already-current graph. "
+                    f"Run a full rebuild (/graphify .) to be safe, or pass force=True "
+                    f"only if you have verified the reduction is legitimate.",
                     file=_sys.stderr,
                 )
                 return False
@@ -654,6 +668,30 @@ def to_html(
                 return
             meta_communities = {cid: [str(cid)] for cid in communities}
             mc = {cid: len(members) for cid, members in communities.items()}
+            # Remap hyperedges from semantic node IDs to community IDs
+            raw_hyperedges = G.graph.get("hyperedges", [])
+            if raw_hyperedges:
+                remapped = []
+                for he in raw_hyperedges:
+                    he_members = he.get("nodes") or he.get("members") or []
+                    comm_ids, seen = [], set()
+                    for nid in he_members:
+                        c = node_to_community.get(nid)
+                        if c is None:
+                            continue
+                        s = str(c)
+                        if s in seen:
+                            continue
+                        seen.add(s)
+                        comm_ids.append(s)
+                    if len(comm_ids) < 2:
+                        continue
+                    remapped.append({
+                        "id": he.get("id", ""),
+                        "label": he.get("label") or he.get("relation", "").replace("_", " "),
+                        "nodes": comm_ids,
+                    })
+                meta.graph["hyperedges"] = remapped
             to_html(meta, meta_communities, output_path,
                     community_labels=community_labels, member_counts=mc)
             print(f"graph.html written (aggregated: {meta.number_of_nodes()} community nodes, {meta.number_of_edges()} cross-community edges)")
@@ -744,7 +782,9 @@ def to_html(
 <head>
 <meta charset="UTF-8">
 <title>graphify - {title}</title>
-<script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+<script src="https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js"
+        integrity="sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1"
+        crossorigin="anonymous"></script>
 {_html_styles()}
 </head>
 <body>
@@ -779,6 +819,23 @@ def to_html(
 generate_html = to_html
 
 
+def _cap_filename(s: str, limit: int = 200) -> str:
+    """Cap a filename stem to ``limit`` UTF-8 bytes so it stays under the 255-byte
+    filesystem limit even after the ``.md`` extension and dedup suffix are added
+    (#1094). The cap is on BYTES, not chars, because a label of multibyte
+    characters (CJK, accented) can exceed 255 bytes well under 255 chars. When
+    truncation happens, an 8-char hash of the full label is appended so two
+    distinct labels sharing a long prefix produce distinct, deterministic
+    filenames instead of colliding."""
+    b = s.encode("utf-8")
+    if len(b) <= limit:
+        return s
+    digest = hashlib.sha1(s.encode("utf-8")).hexdigest()[:8]  # nosec - not security
+    keep = limit - 9  # "_" + 8 hex chars
+    truncated = b[:keep].decode("utf-8", "ignore")  # "ignore" drops a split trailing char
+    return f"{truncated}_{digest}"
+
+
 def to_obsidian(
     G: nx.Graph,
     communities: dict[int, list[str]],
@@ -805,7 +862,7 @@ def to_obsidian(
         cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
         # Strip trailing .md/.mdx/.markdown so "CLAUDE.md" doesn't become "CLAUDE.md.md"
         cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
-        return cleaned or "unnamed"
+        return _cap_filename(cleaned) if cleaned else "unnamed"
 
     node_filename: dict[str, str] = {}
     seen_names: dict[str, int] = {}
@@ -915,12 +972,18 @@ def to_obsidian(
         return len(neighbor_cids)
 
     community_notes_written = 0
-    for cid, members in communities.items():
+    for cid, all_members in communities.items():
         community_name = (
             community_labels.get(cid, f"Community {cid}")
             if community_labels and cid is not None
             else f"Community {cid}"
         )
+        # A community's member list can contain ids with no backing node in G
+        # (e.g. pruned nodes, stale community assignments from a prior run, or
+        # synthesized/merge-artifact ids). Dereferencing those via G.nodes[n] or
+        # node_filename[n] raises KeyError and aborts the whole vault export, so
+        # skip dangling members rather than crashing (issue #1236).
+        members = [m for m in all_members if m in G and m in node_filename]
         n_members = len(members)
         coh_value = cohesion.get(cid) if cohesion else None
 
@@ -1045,7 +1108,7 @@ def to_canvas(
     def safe_name(label: str) -> str:
         cleaned = re.sub(r'[\\/*?:"<>|#^[\]]', "", label.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")).strip()
         cleaned = re.sub(r"\.(md|mdx|qmd|markdown)$", "", cleaned, flags=re.IGNORECASE)
-        return cleaned or "unnamed"
+        return _cap_filename(cleaned) if cleaned else "unnamed"
 
     # Build node_filenames if not provided (same dedup logic as to_obsidian)
     if node_filenames is None:
@@ -1222,7 +1285,10 @@ def push_to_neo4j(
 
     with driver.session() as session:
         for node_id, data in G.nodes(data=True):
-            props = {k: v for k, v in data.items() if isinstance(v, (str, int, float, bool))}
+            props = {
+                k: v for k, v in data.items()
+                if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
+            }
             props["id"] = node_id
             cid = node_community.get(node_id)
             if cid is not None:
@@ -1237,7 +1303,10 @@ def push_to_neo4j(
 
         for u, v, data in G.edges(data=True):
             rel = _safe_rel(data.get("relation", "RELATED_TO"))
-            props = {k: v for k, v in data.items() if isinstance(v, (str, int, float, bool))}
+            props = {
+                k: v for k, v in data.items()
+                if isinstance(v, (str, int, float, bool)) and not k.startswith("_")
+            }
             session.run(
                 f"MATCH (a {{id: $src}}), (b {{id: $tgt}}) "
                 f"MERGE (a)-[r:{rel}]->(b) SET r += $props",
@@ -1265,6 +1334,15 @@ def to_graphml(
     node_community = _node_community_map(communities)
     for node_id in H.nodes():
         H.nodes[node_id]["community"] = node_community.get(node_id, -1)
+    # Drop internal markers (e.g. the AST-provenance "_origin" tag, #1116, and
+    # the "_src"/"_tgt" direction markers) — they are persistence/runtime details,
+    # not graph data, and should not leak into the exported file.
+    for _, attrs in H.nodes(data=True):
+        for k in [k for k in attrs if k.startswith("_")]:
+            del attrs[k]
+    for _, _, attrs in H.edges(data=True):
+        for k in [k for k in attrs if k.startswith("_")]:
+            del attrs[k]
     nx.write_graphml(H, output_path)
 
 

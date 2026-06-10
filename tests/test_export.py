@@ -97,6 +97,33 @@ def test_to_html_contains_visjs():
         content = out.read_text()
         assert "vis-network" in content
 
+
+def test_to_html_pins_visjs_version_with_sri():
+    """vis-network script tag must use a pinned versioned URL with a sha384
+    Subresource Integrity hash and crossorigin=anonymous. Without this,
+    a compromised CDN could ship arbitrary JavaScript into every rendered
+    graph viewer. The hash was verified against the upstream file at
+    https://unpkg.com/vis-network@9.1.6/standalone/umd/vis-network.min.js
+    (sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1).
+    Bumping the vis-network version MUST update both the URL and the hash.
+    """
+    G = make_graph()
+    communities = cluster(G)
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "graph.html"
+        to_html(G, communities, str(out))
+        content = out.read_text()
+
+    # Versioned URL — unversioned `vis-network/standalone/...` is rejected.
+    assert "vis-network@9.1.6/standalone/umd/vis-network.min.js" in content
+    assert "https://unpkg.com/vis-network/standalone" not in content
+
+    # SRI integrity attribute pinning the known-good hash.
+    assert 'integrity="sha384-Ux6phic9PEHJ38YtrijhkzyJ8yQlH8i/+buBR8s3mAZOJrP1gwyvAcIYl3GWtpX1"' in content
+
+    # crossorigin="anonymous" is required for SRI on cross-origin scripts.
+    assert 'crossorigin="anonymous"' in content
+
 def test_to_html_contains_search():
     G = make_graph()
     communities = cluster(G)
@@ -201,8 +228,8 @@ def test_backup_default_labels_only(tmp_path):
     assert backup_if_protected(tmp_path) is None
 
 
-def test_backup_same_day_collision(tmp_path):
-    """Second backup on same day gets _2 suffix."""
+def test_backup_same_day_no_accumulation(tmp_path):
+    """Same content on same day returns existing backup dir without re-copying."""
     from graphify.export import backup_if_protected
     from datetime import date
     (tmp_path / "graph.json").write_text('{"nodes":[],"links":[]}')
@@ -210,8 +237,21 @@ def test_backup_same_day_collision(tmp_path):
     b1 = backup_if_protected(tmp_path)
     b2 = backup_if_protected(tmp_path)
     assert b1 is not None and b2 is not None
-    assert b1 != b2
-    assert b2.name == f"{date.today().isoformat()}_2"
+    assert b1 == b2  # same dir, no _2 accumulation
+    assert b1.name == date.today().isoformat()
+
+
+def test_backup_same_day_changed_content(tmp_path):
+    """Changed graph.json on same day overwrites the existing backup in place."""
+    from graphify.export import backup_if_protected
+    from datetime import date
+    (tmp_path / "graph.json").write_text('{"nodes":[],"links":[]}')
+    (tmp_path / ".graphify_semantic_marker").write_text("{}")
+    b1 = backup_if_protected(tmp_path)
+    (tmp_path / "graph.json").write_text('{"nodes":[{"id":"x"}],"links":[]}')
+    b2 = backup_if_protected(tmp_path)
+    assert b1 == b2  # still one folder per day
+    assert (b2 / "graph.json").read_text() == '{"nodes":[{"id":"x"}],"links":[]}'
 
 
 def test_backup_env_disable(tmp_path, monkeypatch):

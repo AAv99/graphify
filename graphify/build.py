@@ -156,11 +156,65 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
             node["source_file"] = _norm_source_file(node["source_file"], _root)
         G.add_node(node["id"], **{k: v for k, v in node.items() if k != "id"})
     node_set = set(G.nodes())
+
+    # #1145: merge semantic ghost-duplicate nodes into AST nodes.
+    # When AST and semantic extractors emit different IDs for the same symbol
+    # (one has source_location=L<n>, the other has source_location=None), find
+    # pairs that share (source_file basename, label) and collapse the semantic
+    # copy into the AST copy so edges re-point to a single node.
+    # Two passes: first collect all AST (located) nodes, then find ghosts.
+    _loc_nodes: dict[tuple[str, str], str] = {}   # (basename, label) -> AST node id
+    _noloc_nodes: dict[tuple[str, str], str] = {}  # (basename, label) -> semantic node id
+    for nid in node_set:
+        attrs = G.nodes[nid]
+        label = str(attrs.get("label", "")).strip()
+        sf = str(attrs.get("source_file", ""))
+        basename = Path(sf).name if sf else ""
+        if not label or not basename:
+            continue
+        if attrs.get("source_location"):
+            _loc_nodes[(basename, label)] = nid
+    for nid in node_set:
+        attrs = G.nodes[nid]
+        label = str(attrs.get("label", "")).strip()
+        sf = str(attrs.get("source_file", ""))
+        basename = Path(sf).name if sf else ""
+        if not label or not basename or attrs.get("source_location"):
+            continue
+        key = (basename, label)
+        if key in _loc_nodes and _loc_nodes[key] != nid:
+            _noloc_nodes[key] = nid
+    # For every ghost that has an AST counterpart, record a remap.
+    _ghost_remap: dict[str, str] = {}  # ghost_id -> canonical_id
+    for key, sem_id in _noloc_nodes.items():
+        ast_id = _loc_nodes.get(key)
+        if ast_id is not None:
+            _ghost_remap[sem_id] = ast_id
+    # Remove ghost nodes from the graph; edges will be re-pointed via norm_to_id.
+    for ghost_id in _ghost_remap:
+        G.remove_node(ghost_id)
+        node_set.discard(ghost_id)
+
     # Normalized ID map: lets edges survive when the LLM generates IDs with
     # slightly different casing or punctuation than the AST extractor.
     # e.g. "Session_ValidateToken" maps to "session_validatetoken".
     norm_to_id: dict[str, str] = {_normalize_id(nid): nid for nid in node_set}
-    for edge in extraction.get("edges", []):
+    # Also map ghost IDs to their canonical AST replacements.
+    for ghost_id, canonical_id in _ghost_remap.items():
+        norm_to_id[_normalize_id(ghost_id)] = canonical_id
+        norm_to_id[ghost_id] = canonical_id
+    # Iterate edges in a deterministic order. The graph is undirected and stores
+    # direction in _src/_tgt; when two edges collapse onto the same node pair the
+    # last write wins, so an unstable iteration order flips _src/_tgt run-to-run
+    # and makes the serialized graph churn. Sorting fixes the last-write outcome.
+    for edge in sorted(
+        extraction.get("edges", []),
+        key=lambda e: (
+            str(e.get("source", e.get("from", ""))),
+            str(e.get("target", e.get("to", ""))),
+            str(e.get("relation", "")),
+        ),
+    ):
         if "source" not in edge and "from" in edge:
             edge["source"] = edge["from"]
         if "target" not in edge and "to" in edge:
@@ -178,10 +232,40 @@ def build_from_json(extraction: dict, *, directed: bool = False, root: str | Pat
         attrs = {k: v for k, v in edge.items() if k not in ("source", "target")}
         if "source_file" in attrs:
             attrs["source_file"] = _norm_source_file(attrs["source_file"], _root)
+        # Drop cross-language INFERRED `calls` edges — same short names (render,
+        # parse, etc.) appear across language boundaries in multi-language chunks,
+        # producing phantom edges that don't represent real call relationships.
+        if attrs.get("relation") == "calls" and attrs.get("confidence") == "INFERRED":
+            _LANG_FAMILY: dict[str, str] = {
+                ".py": "py", ".pyi": "py",
+                ".js": "js", ".mjs": "js", ".cjs": "js", ".jsx": "js",
+                ".ts": "js", ".tsx": "js",
+                ".go": "go", ".rs": "rs",
+                ".java": "jvm", ".kt": "jvm", ".scala": "jvm", ".groovy": "jvm",
+                ".c": "c", ".h": "c", ".cc": "cpp", ".cpp": "cpp", ".hpp": "cpp",
+                ".rb": "rb", ".php": "php", ".cs": "cs", ".swift": "swift", ".lua": "lua",
+            }
+            src_ext = Path(G.nodes[src].get("source_file") or "").suffix.lower()
+            tgt_ext = Path(G.nodes[tgt].get("source_file") or "").suffix.lower()
+            if src_ext and tgt_ext and _LANG_FAMILY.get(src_ext) != _LANG_FAMILY.get(tgt_ext):
+                continue
         # Preserve original edge direction - undirected graphs lose it otherwise,
         # causing display functions to show edges backwards.
         attrs["_src"] = src
         attrs["_tgt"] = tgt
+        # When the graph is undirected and the same node pair appears twice with
+        # the same relation but opposite directions (e.g. a `calls` b and b `calls` a),
+        # nx.Graph collapses them into one edge. The deterministic sort above means
+        # the lexicographically-later direction would systematically overwrite the
+        # earlier one's _src/_tgt, silently flipping the surviving edge's caller
+        # and callee. First-seen direction wins instead — drop the redundant
+        # reverse-direction duplicate so the original direction is preserved (#1061).
+        if not G.is_directed() and G.has_edge(src, tgt):
+            existing = edge_data(G, src, tgt)
+            if existing.get("relation") == attrs.get("relation") and (
+                existing.get("_src") == tgt and existing.get("_tgt") == src
+            ):
+                continue
         G.add_edge(src, tgt, **attrs)
     hyperedges = extraction.get("hyperedges", [])
     if hyperedges:
@@ -227,9 +311,12 @@ def build(
     return build_from_json(combined, directed=directed, root=root)
 
 
-def _norm_label(label: str) -> str:
-    """Canonical dedup key — lowercase, alphanumeric only."""
-    return re.sub(r"[^a-z0-9 ]", "", label.lower()).strip()
+def _norm_label(label: str | None) -> str:
+    """Canonical dedup key — Unicode-aware, preserves CJK/word characters."""
+    if not isinstance(label, str):
+        label = "" if label is None else str(label)
+    label = unicodedata.normalize("NFKC", label)
+    return re.sub(r"[\W_ ]+", " ", label.casefold(), flags=re.UNICODE).strip()
 
 
 def deduplicate_by_label(nodes: list[dict], edges: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -303,6 +390,8 @@ def build_merge(
         # was inserted before the caller. The _src/_tgt direction-preserving
         # attrs are popped before saving in export.py, so going through the
         # NetworkX round-trip loses direction permanently (#760).
+        from graphify.security import check_graph_file_size_cap
+        check_graph_file_size_cap(graph_path)
         data = json.loads(graph_path.read_text(encoding="utf-8"))
         links_key = "links" if "links" in data else "edges"
         existing_nodes = list(data.get("nodes", []))
@@ -317,7 +406,21 @@ def build_merge(
 
     # Prune nodes and edges from deleted source files
     if prune_sources:
-        prune_set = set(prune_sources)
+        # Build a set containing both the raw form (matches nodes that kept
+        # absolute source_file) and the normalised relative form (matches nodes
+        # that were relativised by _norm_source_file at build time).
+        # .resolve() handles symlinked roots and redundant ".." / "./" segments
+        # so Path.relative_to() succeeds even when the scan root is a symlink.
+        # (#1007: manifest absolute paths vs graph relative source_file mismatch)
+        _root_str = str(Path(root).resolve()) if root is not None else None
+        prune_set: set[str] = set()
+        for p in prune_sources:
+            if not p:
+                continue
+            prune_set.add(p)
+            norm = _norm_source_file(p, _root_str)
+            if norm:
+                prune_set.add(norm)
         to_remove = [
             n for n, d in G.nodes(data=True)
             if d.get("source_file") in prune_set

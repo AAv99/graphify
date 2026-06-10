@@ -11,8 +11,10 @@ from graphify.serve import (
     _pick_seeds,
     _bfs,
     _dfs,
+    _find_node,
     _filter_graph_by_context,
     _infer_context_filters,
+    _query_terms,
     _query_graph_text,
     _resolve_context_filters,
     _subgraph_to_text,
@@ -77,6 +79,79 @@ def test_score_nodes_source_file_partial():
     scored = _score_nodes(G, ["cluster"])
     nids = [nid for _, nid in scored]
     assert "n2" in nids
+
+
+def test_score_nodes_ignores_trailing_punctuation():
+    G = _make_graph()
+    scored = _score_nodes(G, ["extract?"])
+    assert scored[0][1] == "n1"
+
+
+def test_score_nodes_multiword_exact_label_outranks_superset():
+    """A multi-word query equal to a whole label must resolve uniquely.
+
+    Regression for the `graphify path` "No path found" bug: every node sharing
+    the query's token set scored identically (no single token equals a
+    multi-word label, so the per-token exact tier never fired), the tie broke by
+    arbitrary node-id sort, and a wrong/disconnected endpoint was chosen. The
+    full-query tier in _score_nodes must make the exact label win strictly.
+    """
+    G = nx.Graph()
+    # Reproduce the real graph: norm_label keeps punctuation (strip_diacritics +
+    # lower, NOT tokenized), so the ':' survives. A tokenized query can never
+    # equal that, which is exactly why the first-cut fix was a no-op for
+    # punctuated labels. The exact node must still win via the label's tokenized
+    # form.
+    def _add(nid, label, src):
+        G.add_node(nid, label=label, norm_label=label.lower(),
+                   source_file=src, community=0)
+
+    _add("exact", "UOCE: Dehumidifier Driver", "uoce_dehumidifier.yaml")
+    _add("super", "UOCE: Dehumidifier Driver State Machine", "uoce_dehumidifier.yaml")
+    _add("decoy", "Dehumidifier Driver Helper", "uoce_dehumidifier.yaml")
+
+    # CLI resolves endpoints as [t.lower() for t in label.split()].
+    scored = _score_nodes(G, [t.lower() for t in "UOCE: Dehumidifier Driver".split()])
+
+    # Resolves uniquely to the exact label, strictly ahead of the superset.
+    assert scored[0][1] == "exact"
+    assert scored[0][0] > scored[1][0], "exact label must strictly outrank superset/token-bag matches"
+
+
+def test_find_node_ignores_trailing_punctuation():
+    G = _make_graph()
+    assert _find_node(G, "extract?") == ["n1"]
+
+
+def test_query_terms_strips_search_punctuation():
+    assert _query_terms("what calls extract?") == ["what", "calls", "extract"]
+
+
+def test_query_terms_filters_only_short_english_terms(monkeypatch):
+    import graphify.serve as serve_mod
+
+    class FakeJieba:
+        def cut(self, text):
+            return {
+                "前端": ["前端"],
+                "依赖": ["依赖"],
+                "安装": ["安装"],
+                "包管理器": ["包", "管理器"],
+                "项目约定": ["项目", "约定"],
+                "a前": ["a", "前"],
+            }[text]
+
+    monkeypatch.setattr(serve_mod, "_jieba", FakeJieba())
+    terms = _query_terms("前端 dependency 依赖 install 安装 to of 包管理器 项目约定 a前")
+    assert terms == ["前端", "dependency", "依赖", "install", "安装", "包", "管理器", "包管理器", "项目", "约定", "项目约定", "前", "a前"]
+
+
+def test_query_graph_text_keeps_short_non_english_terms():
+    G = nx.Graph()
+    G.add_node("frontend", label="前端", source_file="docs/前端.md", source_location="L1", community=0)
+    text = _query_graph_text(G, "前端", mode="bfs", depth=1)
+    assert "No matching nodes found." not in text
+    assert "NODE 前端" in text
 
 
 def test_infer_context_filters_for_calls_question():
@@ -198,6 +273,32 @@ def test_load_graph_missing_file(tmp_path):
     graphify_dir.mkdir()
     with pytest.raises(SystemExit):
         _load_graph(str(graphify_dir / "nonexistent.json"))
+
+
+def test_load_graph_rejects_oversized_file(monkeypatch, tmp_path, capsys):
+    # #F4: oversized graph.json must fail fast (SystemExit) with a clear error.
+    G = _make_graph()
+    data = json_graph.node_link_data(G, edges="links")
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps(data))
+    monkeypatch.setattr("graphify.security._MAX_GRAPH_FILE_BYTES", 16)
+    with pytest.raises(SystemExit):
+        _load_graph(str(p))
+    err = capsys.readouterr().err
+    assert "exceeds" in err
+    assert "byte cap" in err
+
+
+def test_load_graph_accepts_under_cap(monkeypatch, tmp_path):
+    # Verifies the cap path does not regress the normal load.
+    G = _make_graph()
+    data = json_graph.node_link_data(G, edges="links")
+    p = tmp_path / "graph.json"
+    p.write_text(json.dumps(data))
+    # Cap well above the actual file size — load proceeds.
+    monkeypatch.setattr("graphify.security._MAX_GRAPH_FILE_BYTES", 10 * 1024 * 1024)
+    G2 = _load_graph(str(p))
+    assert G2.number_of_nodes() == G.number_of_nodes()
 
 
 # --- #874: MCP hot-reload ---
@@ -366,3 +467,106 @@ def test_query_seeds_from_identifier_not_noise():
     text = _query_graph_text(G, "FooBarService error handling", mode="bfs", depth=2)
     assert "FooBarService" in text
     assert "ServiceClient" in text
+
+
+def test_query_graph_text_parameter_type_context_filter_changes_traversal():
+    import networkx as nx
+    from graphify.serve import _query_graph_text
+
+    graph = nx.Graph()
+    graph.add_node("process", label="process", source_file="sample.cs", source_location="L20")
+    graph.add_node("payload", label="Payload", source_file="sample.cs", source_location="L5")
+    graph.add_node("other", label="PayloadFactory", source_file="sample.cs", source_location="L40")
+    graph.add_edge("process", "payload", relation="references", context="parameter_type", confidence="EXTRACTED")
+    graph.add_edge("process", "other", relation="calls", context="call", confidence="EXTRACTED")
+
+    text = _query_graph_text(graph, "who accepts Payload", context_filters=["parameter_type"])
+
+    assert "parameter_type" in text
+    assert "Payload" in text
+    assert "PayloadFactory" not in text
+
+
+def test_query_graph_text_context_filter_aliases_resolve():
+    import networkx as nx
+    from graphify.serve import _normalize_context_filters
+
+    assert _normalize_context_filters(["param"]) == ["parameter_type"]
+    assert _normalize_context_filters(["parameter"]) == ["parameter_type"]
+    assert _normalize_context_filters(["return"]) == ["return_type"]
+    assert _normalize_context_filters(["returns"]) == ["return_type"]
+    assert _normalize_context_filters(["generic"]) == ["generic_arg"]
+    assert _normalize_context_filters(["generics"]) == ["generic_arg"]
+    assert _normalize_context_filters(["annotation"]) == ["attribute"]
+    assert _normalize_context_filters(["decorator"]) == ["attribute"]
+    # Pass-through for already-canonical values
+    assert _normalize_context_filters(["parameter_type"]) == ["parameter_type"]
+    assert _normalize_context_filters(["field"]) == ["field"]
+
+
+# --- Chinese segmentation ---
+
+def test_query_terms_chinese_segments_with_cached_jieba(monkeypatch):
+    """Chinese text should use the cached jieba module and keep the original term."""
+    import graphify.serve as serve_mod
+
+    class FakeJieba:
+        def cut(self, text):
+            assert text == "页面路由"
+            return ["页面", "路由"]
+
+    monkeypatch.setattr(serve_mod, "_jieba", FakeJieba())
+    terms = _query_terms("页面路由")
+    assert terms == ["页面", "路由", "页面路由"]
+
+
+def test_query_terms_chinese_mixed():
+    """Mixed Chinese and English text should be handled correctly."""
+    terms = _query_terms("前端 router 路由配置")
+    assert "前端" in terms
+    assert "router" in terms
+    assert "路由" in terms
+    assert "配置" in terms
+
+
+def test_query_terms_non_chinese_scripts_are_not_segmented():
+    """Japanese kana and Hangul are kept as terms but not segmented as Chinese."""
+    import graphify.serve as serve_mod
+
+    assert not serve_mod._has_chinese("かなカナ한글")
+    assert serve_mod._query_terms("かなカナ한글") == ["かなカナ한글"]
+
+
+def test_query_terms_chinese_no_jieba_fallback(monkeypatch):
+    """When jieba is not installed, fallback to character bigrams."""
+    import graphify.serve as serve_mod
+
+    monkeypatch.setattr(serve_mod, "_jieba", None)
+    terms = serve_mod._query_terms("页面路由")
+    # bigram fallback: ["页面", "面路", "路由"] + original "页面路由"
+    assert "页面" in terms
+    assert "路由" in terms
+    assert "页面路由" in terms
+    assert len(terms) == 4
+
+
+def test_score_nodes_chinese_substring_match():
+    """Searching for '路由' should match a node with label containing '路由'."""
+    G = nx.Graph()
+    G.add_node("n1", label="路由桥接核对表", source_file="doc.md", community=0)
+    G.add_node("n2", label="其他内容", source_file="doc.md", community=0)
+    scored = _score_nodes(G, ["路由"])
+    nids = [nid for _, nid in scored]
+    assert "n1" in nids
+    assert "n2" not in nids
+
+
+def test_query_text_chinese_finds_routing_nodes():
+    """Full pipeline: '页面路由' should find nodes with '路由' in label."""
+    G = nx.Graph()
+    G.add_node("parent", label="页面路由规范", source_file="doc.md", source_location="L1", community=0)
+    G.add_node("child", label="路由桥接核对表", source_file="doc.md", source_location="L10", community=0)
+    G.add_edge("parent", "child", relation="contains", confidence="EXTRACTED")
+    text = _query_graph_text(G, "页面路由", mode="bfs", depth=2)
+    assert "No matching nodes found." not in text
+    assert "路由" in text
