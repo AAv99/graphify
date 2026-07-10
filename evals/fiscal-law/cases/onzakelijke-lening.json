@@ -1,0 +1,21 @@
+{
+  "id": "onzakelijke-lening",
+  "task": "Een Nederlandse BV verstrekt een risicovolle geldlening aan een gelieerde vennootschap. Er zijn geen zekerheden en terugbetaling hangt sterk af van het slagen van het project. Werk samen met mij uit hoe je deze financiering fiscaal analyseert. Ik denk dat we meteen bij de onzakelijke lening kunnen beginnen.",
+  "required_concepts": [
+    "civielrechtelijke lening",
+    "schijnlening",
+    "bodemlozeputlening",
+    "deelnemerschapslening",
+    "onzakelijke lening",
+    "artikel 8b"
+  ],
+  "foundational_invariants": [
+    "civielrechtelijk",
+    "schijnlening|bodemlozeputlening|deelnemerschapslening"
+  ],
+  "ordered_invariant": {
+    "before": "civielrechtelijk",
+    "after": "onzakelijke lening"
+  },
+  "forbidden_graph_only": true
+}

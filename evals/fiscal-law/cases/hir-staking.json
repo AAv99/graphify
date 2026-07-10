@@ -1,0 +1,15 @@
+{
+  "id": "hir-staking",
+  "task": "Een ondernemer verkoopt in jaar 1 een bedrijfsmiddel met boekwinst. Op balansdatum wil hij een vervangend bedrijfsmiddel aanschaffen. In jaar 2 besluit hij zijn gehele onderneming te staken. Werk deze kwestie samen met mij uit: welke fiscale vragen moeten we onderzoeken en waarom? Geef nog geen lang eindantwoord; bouw eerst de analyse op.",
+  "required_concepts": [
+    "herinvesteringsreserve",
+    "herinvesteringsvoornemen",
+    "staking"
+  ],
+  "foundational_invariants": [
+    "herinvesteringsvoornemen",
+    "staking"
+  ],
+  "forbidden_graph_only": true,
+  "oracle_file": "giw-hir-staking-voornemen.md"
+}
