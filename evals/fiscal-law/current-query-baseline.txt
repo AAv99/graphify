@@ -1,0 +1,22 @@
+Traversal: BFS depth=2 | Start: ['Herinvesteringsreserve', 'Staking'] | 11 nodes found
+
+NODE Staking (Van Kempen) [src=graphify-out/converted/Collegeweek V_e9893134.md loc= community=7]
+NODE Herinvesteringsreserve [src=Grondslagen inkomstenbelasting Winst/knowledge-base/notes/herinvesteringsreserve.md loc=None community=11]
+NODE Staking en stakingswinst [src=Grondslagen inkomstenbelasting Winst/knowledge-base/notes/staking-en-stakingswinst.md loc=None community=11]
+NODE Art. 3.54 Wet IB 2001 (HIR) [src=graphify-out/converted/Collegeweek V_e9893134.md loc= community=7]
+NODE Staking [src=Grondslagen inkomstenbelasting Winst/tmp/slides/week5-personenvennootschappen/preview/slide-06.png loc= community=7]
+NODE Artikel 3.54 Wet IB 2001 (Herinvesteringsreserve) [src=Grondslagen inkomstenbelasting Winst/Handout GIBW 4 maart 226 Staking en HIR Thil van Kempen.pdf loc=None community=11]
+NODE Art. 3.64 Wet IB 2001 [src=graphify-out/converted/Collegeweek V_e9893134.md loc= community=7]
+NODE Staking van de onderneming [src=Grondslagen inkomstenbelasting Winst/Handout GIBW 4 maart 226 Staking en HIR Thil van Kempen.pdf loc=None community=11]
+NODE Geruisloze doorschuiving art. 3.63 Wet IB 2001 [src=Grondslagen inkomstenbelasting Winst/knowledge-base/notes/geruisloze-doorschuiving-art-363-wet-ib-2001.md loc=None community=11]
+NODE BNB 2012/286 (Staking of verplaatsing) [src=graphify-out/converted/Collegeweek V_e9893134.md loc= community=7]
+NODE Art. 3.8 Wet IB 2001 [src=graphify-out/converted/Collegeweek V_e9893134.md loc= community=7]
+EDGE Staking --conceptually_related_to [INFERRED]--> Staking (Van Kempen)
+EDGE Herinvesteringsreserve --conceptually_related_to [EXTRACTED]--> Staking van de onderneming
+EDGE Herinvesteringsreserve --implements [INFERRED]--> Artikel 3.54 Wet IB 2001 (Herinvesteringsreserve)
+EDGE Herinvesteringsreserve --conceptually_related_to [EXTRACTED]--> Staking en stakingswinst
+EDGE Staking en stakingswinst --conceptually_related_to [EXTRACTED]--> Geruisloze doorschuiving art. 3.63 Wet IB 2001
+EDGE Staking (Van Kempen) --references [EXTRACTED]--> Art. 3.8 Wet IB 2001
+EDGE Staking (Van Kempen) --references [EXTRACTED]--> BNB 2012/286 (Staking of verplaatsing)
+EDGE Staking (Van Kempen) --references [EXTRACTED]--> Art. 3.54 Wet IB 2001 (HIR)
+EDGE Staking (Van Kempen) --references [EXTRACTED]--> Art. 3.64 Wet IB 2001
